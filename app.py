@@ -110,6 +110,33 @@ def _log_exception(prefix: str, exc: BaseException) -> None:
         st.code(detail)
 
 
+def _debug_sheets_brake(gs_cfg: Optional[Tuple[dict, str]]) -> None:
+    """If DEBUG_SHEETS is enabled in Streamlit secrets, run a Sheets connect test and stop.
+
+    Add to Streamlit Cloud secrets:
+      DEBUG_SHEETS = true
+    """
+    if not st.secrets.get("DEBUG_SHEETS", False):
+        return
+
+    st.warning("DEBUG_SHEETS is enabled: running Google Sheets connection test...")
+    if not gs_cfg:
+        st.error("Missing gcp_service_account or GSHEET_ID in secrets.")
+        st.stop()
+
+    try:
+        sa_info, sheet_id = gs_cfg
+        ws = _open_worksheet(sa_info, sheet_id)
+        # We managed to open: show friendly confirmation.
+        st.success(f"Google Sheets connection OK. Worksheet: {ws.title}")
+        st.info("Disable DEBUG_SHEETS in secrets to continue running the full app.")
+        st.stop()
+    except Exception as e:
+        _log_exception("Google Sheets connection test FAILED.", e)
+        st.info("Fix the error above, then disable DEBUG_SHEETS in secrets and reboot the app.")
+        st.stop()
+
+
 @st.cache_resource(show_spinner=False)
 def _get_gspread_client(service_account_info: dict):
     import gspread
@@ -247,6 +274,9 @@ def main() -> None:
 
     gs_cfg = _gsheets_config_from_secrets()
     using_sheets = bool(gs_cfg) and _can_use_sheets(gs_cfg)  # only True if we can open it
+
+    # Optional emergency brake mode for Streamlit Cloud debugging.
+    _debug_sheets_brake(gs_cfg)
 
     with st.expander("Google Sheets status / debug", expanded=False):
         st.write(
