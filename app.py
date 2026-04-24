@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import random
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -96,6 +97,16 @@ def _gsheets_config_from_secrets() -> Optional[Tuple[dict, str]]:
         return None
 
     return sa, str(sheet_id)
+
+
+def _log_exception(prefix: str, exc: BaseException) -> None:
+    # Streamlit Cloud shows stdout/stderr in logs; also show in-app for visibility.
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    print(prefix)
+    print(detail)
+    st.error(prefix)
+    with st.expander("Details (exception)"):
+        st.code(detail)
 
 
 @st.cache_resource(show_spinner=False)
@@ -223,6 +234,15 @@ def main() -> None:
     gs_cfg = _gsheets_config_from_secrets()
     using_sheets = gs_cfg is not None
 
+    with st.expander("Google Sheets status / debug", expanded=False):
+        st.write(
+            {
+                "has_gcp_service_account_secret": bool(st.secrets.get("gcp_service_account", None)),
+                "has_GSHEET_ID_secret": bool(st.secrets.get("GSHEET_ID", None)),
+                "using_sheets": using_sheets,
+            }
+        )
+
     st.write(
         "Evaluate AI-generated questions. "
         + (
@@ -257,8 +277,20 @@ def main() -> None:
             ws = _open_worksheet(sa_info, sheet_id)
             ensure_sheet_headers(ws)
             seen_ids = load_evaluations_for_user_sheet(ws, reviewer_email)
+
+            with st.expander("Google Sheets connection info", expanded=False):
+                try:
+                    st.write(
+                        {
+                            "spreadsheet_id": sheet_id,
+                            "worksheet_title": getattr(ws, "title", None),
+                            "worksheet_id": getattr(ws, "id", None),
+                        }
+                    )
+                except Exception:
+                    st.write("Connected, but could not read worksheet metadata.")
         except Exception as e:
-            st.error(f"Google Sheets is configured but could not be opened: {e}")
+            _log_exception("Google Sheets is configured but could not be opened.", e)
             st.info("Falling back to local CSV for this session.")
             using_sheets = False
 
@@ -362,7 +394,7 @@ def main() -> None:
             append_rows_to_sheet(ws, rows)
             sheets_ok = True
         except Exception as e:
-            st.error(f"Failed to write to Google Sheets: {e}")
+            _log_exception("Failed to write to Google Sheets.", e)
             st.info("Your responses will still be written to local CSV (may be ephemeral on Streamlit Cloud).")
 
     try:
