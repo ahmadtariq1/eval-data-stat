@@ -1,0 +1,255 @@
+import csv
+import json
+import os
+import random
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set
+
+import streamlit as st
+
+DATA_PATH = "questions_only.jsonl"
+DB_PATH = "evaluation_stats.csv"
+
+ROLES = ["Premed Student", "Med Student", "Teacher", "Doctor", "Other"]
+
+CSV_HEADERS = [
+    "Timestamp",
+    "Reviewer_Email",
+    "Reviewer_Role",
+    "Question_ID",
+    "Is_Correct",
+    "Difficulty",
+    "MDCAT_Alignment",
+    "Comments",
+]
+
+
+@dataclass(frozen=True)
+class Question:
+    uid: str
+    batch_idx: int
+    question_number: int
+    question_text: str
+    options: Dict[str, str]
+    correct_answer: str
+
+
+def _normalize_options(options: Any) -> Dict[str, str]:
+    if not isinstance(options, dict):
+        return {}
+    normalized: Dict[str, str] = {}
+    for k, v in options.items():
+        if k is None:
+            continue
+        normalized[str(k).strip().upper()] = "" if v is None else str(v)
+    return normalized
+
+
+def ensure_csv_exists(path: str) -> None:
+    if os.path.exists(path):
+        return
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_HEADERS)
+
+
+def load_evaluations_for_user(path: str, reviewer_email: str) -> Set[str]:
+    seen: Set[str] = set()
+    if not os.path.exists(path):
+        return seen
+
+    with open(path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if (row.get("Reviewer_Email") or "").strip() == reviewer_email.strip():
+                qid = (row.get("Question_ID") or "").strip()
+                if qid:
+                    seen.add(qid)
+    return seen
+
+
+def load_questions(jsonl_path: str) -> List[Question]:
+    questions: List[Question] = []
+
+    if not os.path.exists(jsonl_path):
+        return questions
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for batch_idx, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            batch_questions = obj.get("questions") or []
+            if not isinstance(batch_questions, list):
+                continue
+
+            for q in batch_questions:
+                if not isinstance(q, dict):
+                    continue
+                qnum = q.get("question_number")
+                try:
+                    qnum_int = int(qnum)
+                except Exception:
+                    continue
+
+                uid = f"Batch{batch_idx}_Q{qnum_int}"
+                options = _normalize_options(q.get("options"))
+                correct = "" if q.get("correct_answer") is None else str(q.get("correct_answer")).strip().upper()
+
+                questions.append(
+                    Question(
+                        uid=uid,
+                        batch_idx=batch_idx,
+                        question_number=qnum_int,
+                        question_text="" if q.get("question_text") is None else str(q.get("question_text")),
+                        options=options,
+                        correct_answer=correct,
+                    )
+                )
+
+    return questions
+
+
+def pick_session_batch(unseen: List[Question], n: int = 15) -> List[Question]:
+    if len(unseen) <= n:
+        return list(unseen)
+    return random.sample(unseen, n)
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def main() -> None:
+    st.set_page_config(page_title="MDCAT Biology Question Evaluator", layout="wide")
+    st.title("MDCAT Biology Question Evaluator")
+    st.write(
+        "Evaluate AI-generated questions. Your responses are saved locally to `evaluation_stats.csv`, "
+        "and you won't see the same question twice under the same Email/Name."
+    )
+
+    # --- Onboarding
+    reviewer_email = st.text_input("Your Email or Name", key="reviewer_email")
+    reviewer_role = st.selectbox("Your Role", options=ROLES, index=None, placeholder="Select your role", key="reviewer_role")
+
+    if not reviewer_email or not reviewer_role:
+        st.info("Please enter your Email/Name and select your role to begin.")
+        return
+
+    ensure_csv_exists(DB_PATH)
+
+    # --- Load data
+    all_questions = load_questions(DATA_PATH)
+    if not all_questions:
+        st.error(f"No questions found. Make sure `{DATA_PATH}` exists and is valid JSONL.")
+        return
+
+    seen_ids = load_evaluations_for_user(DB_PATH, reviewer_email)
+    unseen = [q for q in all_questions if q.uid not in seen_ids]
+
+    st.caption(f"Total questions: {len(all_questions)} | Already evaluated by you: {len(seen_ids)} | Remaining: {len(unseen)}")
+
+    if not unseen:
+        st.balloons()
+        st.success("You're done! You have evaluated all available questions in the dataset.")
+        return
+
+    # --- Session batch
+    batch_key = "current_batch_uids"
+    if batch_key not in st.session_state:
+        picked = pick_session_batch(unseen, n=15)
+        st.session_state[batch_key] = [q.uid for q in picked]
+
+    # If user evaluated some in another tab, refresh unseen list + batch pruning.
+    current_uids: List[str] = list(st.session_state.get(batch_key, []))
+    unseen_by_uid = {q.uid: q for q in unseen}
+    current_questions: List[Question] = [unseen_by_uid[uid] for uid in current_uids if uid in unseen_by_uid]
+
+    # If batch became empty (e.g., all got evaluated), re-pick.
+    if not current_questions:
+        picked = pick_session_batch(unseen, n=15)
+        st.session_state[batch_key] = [q.uid for q in picked]
+        current_questions = picked
+
+    st.subheader("Your current batch")
+    st.write(f"Questions in this batch: {len(current_questions)}")
+
+    with st.form("evaluation_form"):
+        for i, q in enumerate(current_questions, start=1):
+            st.markdown(f"---\n### Q{i}. ({q.uid})\n\n{q.question_text}")
+
+            # Options
+            for opt_key in ["A", "B", "C", "D"]:
+                if opt_key in q.options:
+                    st.markdown(f"- **{opt_key}.** {q.options[opt_key]}")
+
+            st.markdown(f"**Provided correct answer:** `{q.correct_answer}`")
+
+            st.radio(
+                "Is the answer correct?",
+                options=["Yes", "No", "Needs slight modification"],
+                key=f"is_correct__{q.uid}",
+                horizontal=True,
+            )
+            st.radio(
+                "Difficulty",
+                options=["Easy", "Medium", "Hard"],
+                key=f"difficulty__{q.uid}",
+                horizontal=True,
+            )
+            st.radio(
+                "Aligns with MDCAT style?",
+                options=["Yes", "No"],
+                key=f"alignment__{q.uid}",
+                horizontal=True,
+            )
+            st.text_input(
+                "Comments / Suggested Fixes (optional)",
+                key=f"comments__{q.uid}",
+            )
+
+        submitted = st.form_submit_button("Submit Evaluations")
+
+    if not submitted:
+        return
+
+    # --- Persist
+    rows: List[List[str]] = []
+    for q in current_questions:
+        is_correct = st.session_state.get(f"is_correct__{q.uid}")
+        difficulty = st.session_state.get(f"difficulty__{q.uid}")
+        alignment = st.session_state.get(f"alignment__{q.uid}")
+        comments = st.session_state.get(f"comments__{q.uid}", "")
+
+        rows.append(
+            [
+                utc_now_iso(),
+                reviewer_email.strip(),
+                reviewer_role,
+                q.uid,
+                str(is_correct or ""),
+                str(difficulty or ""),
+                str(alignment or ""),
+                str(comments or ""),
+            ]
+        )
+
+    with open(DB_PATH, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+
+    # Clear batch and rerun for next unseen questions
+    st.session_state.pop(batch_key, None)
+
+    # If user just finished everything, celebrate on the next run.
+    st.rerun()
+
+
+if __name__ == "__main__":
+    main()
