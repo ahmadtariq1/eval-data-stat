@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import random
+import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -419,24 +420,40 @@ def main() -> None:
 
     if sheets_ok:
         st.success("Saved to Google Sheets.")
-    else:
-        st.warning("Saved locally only (Sheets not used or failed).")
+        st.session_state.pop(batch_key, None)
 
-    with st.expander("Submission debug", expanded=False):
-        st.write(
-            {
-                "using_sheets": using_sheets,
-                "sheets_ok": sheets_ok,
-                "rows": len(rows),
-                "csv_backup": DB_PATH,
-            }
+        with st.expander("Submission debug", expanded=False):
+            st.write(
+                {
+                    "using_sheets": using_sheets,
+                    "sheets_ok": sheets_ok,
+                    "rows": len(rows),
+                    "csv_backup": DB_PATH,
+                }
+            )
+
+        time.sleep(1.5)
+        st.rerun()
+    else:
+        st.warning("Saved locally only. Google Sheets connection FAILED (or not used).")
+        st.error(
+            "Scroll up and open the error box that says 'Google Sheets preflight check failed'. "
+            "Expand the exception details to see exactly why Google rejected the connection."
         )
 
-    # Clear batch and rerun for next unseen questions
-    st.session_state.pop(batch_key, None)
+        with st.expander("Submission debug", expanded=True):
+            st.write(
+                {
+                    "using_sheets": using_sheets,
+                    "sheets_ok": sheets_ok,
+                    "rows": len(rows),
+                    "csv_backup": DB_PATH,
+                }
+            )
 
-    # If user just finished everything, celebrate on the next run.
-    st.rerun()
+        # Clear batch so the reviewer doesn't get stuck on the same items.
+        st.session_state.pop(batch_key, None)
+        # Intentionally DO NOT rerun here, so the user can read/debug.
 
 
 if __name__ == "__main__":
