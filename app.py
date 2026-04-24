@@ -4,7 +4,7 @@ import os
 import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import streamlit as st
 
@@ -54,7 +54,7 @@ def ensure_csv_exists(path: str) -> None:
         writer.writerow(CSV_HEADERS)
 
 
-def load_evaluations_for_user(path: str, reviewer_email: str) -> Set[str]:
+def load_evaluations_for_user_csv(path: str, reviewer_email: str) -> Set[str]:
     seen: Set[str] = set()
     if not os.path.exists(path):
         return seen
@@ -67,6 +67,96 @@ def load_evaluations_for_user(path: str, reviewer_email: str) -> Set[str]:
                 if qid:
                     seen.add(qid)
     return seen
+
+
+def append_rows_to_csv(path: str, rows: List[List[str]]) -> None:
+    ensure_csv_exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerows(rows)
+
+
+def _gsheets_config_from_secrets() -> Optional[Tuple[dict, str]]:
+    """Reads Streamlit secrets.
+
+    Supports the exact structure the user created:
+      - [gcp_service_account] ...service account fields...
+      - GSHEET_ID (string)
+    """
+    try:
+        sa = st.secrets.get("gcp_service_account")
+        sheet_id = st.secrets.get("GSHEET_ID")
+    except Exception:
+        return None
+
+    if not sa or not sheet_id:
+        return None
+
+    if not isinstance(sa, dict):
+        return None
+
+    return sa, str(sheet_id)
+
+
+@st.cache_resource(show_spinner=False)
+def _get_gspread_client(service_account_info: dict):
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+    return gspread.authorize(creds)
+
+
+def _open_worksheet(service_account_info: dict, spreadsheet_id: str):
+    client = _get_gspread_client(service_account_info)
+    sh = client.open_by_key(spreadsheet_id)
+    # Use the first worksheet by default.
+    return sh.sheet1
+
+
+def ensure_sheet_headers(ws) -> None:
+    expected = CSV_HEADERS
+    try:
+        first_row = ws.row_values(1)
+    except Exception:
+        first_row = []
+
+    if [c.strip() for c in first_row] == expected:
+        return
+
+    if not first_row:
+        ws.append_row(expected, value_input_option="RAW")
+        return
+
+    st.warning(
+        "Google Sheet header row doesn't match expected columns. "
+        "Expected: " + ", ".join(expected)
+    )
+
+
+def load_evaluations_for_user_sheet(ws, reviewer_email: str) -> Set[str]:
+    seen: Set[str] = set()
+    try:
+        records = ws.get_all_records()  # uses first row as header
+    except Exception as e:
+        st.error(f"Failed to read Google Sheet records: {e}")
+        return seen
+
+    target = reviewer_email.strip()
+    for r in records:
+        if str(r.get("Reviewer_Email", "")).strip() == target:
+            qid = str(r.get("Question_ID", "")).strip()
+            if qid:
+                seen.add(qid)
+    return seen
+
+
+def append_rows_to_sheet(ws, rows: List[List[str]]) -> None:
+    ws.append_rows(rows, value_input_option="RAW")
 
 
 def load_questions(jsonl_path: str) -> List[Question]:
@@ -129,9 +219,18 @@ def utc_now_iso() -> str:
 def main() -> None:
     st.set_page_config(page_title="MDCAT Biology Question Evaluator", layout="wide")
     st.title("MDCAT Biology Question Evaluator")
+
+    gs_cfg = _gsheets_config_from_secrets()
+    using_sheets = gs_cfg is not None
+
     st.write(
-        "Evaluate AI-generated questions. Your responses are saved locally to `evaluation_stats.csv`, "
-        "and you won't see the same question twice under the same Email/Name."
+        "Evaluate AI-generated questions. "
+        + (
+            "Your responses are saved to **Google Sheets** (persistent) and also to a local CSV as a best-effort backup. "
+            if using_sheets
+            else "Your responses are saved locally to `evaluation_stats.csv` (not persistent on Streamlit Cloud). "
+        )
+        + "You won't see the same question twice under the same Email/Name."
     )
 
     # --- Onboarding
@@ -142,15 +241,31 @@ def main() -> None:
         st.info("Please enter your Email/Name and select your role to begin.")
         return
 
-    ensure_csv_exists(DB_PATH)
-
     # --- Load data
     all_questions = load_questions(DATA_PATH)
     if not all_questions:
         st.error(f"No questions found. Make sure `{DATA_PATH}` exists and is valid JSONL.")
         return
 
-    seen_ids = load_evaluations_for_user(DB_PATH, reviewer_email)
+    # --- Load seen IDs (Sheets first; fallback to local CSV)
+    seen_ids: Set[str] = set()
+
+    ws = None
+    if using_sheets:
+        try:
+            sa_info, sheet_id = gs_cfg  # type: ignore[misc]
+            ws = _open_worksheet(sa_info, sheet_id)
+            ensure_sheet_headers(ws)
+            seen_ids = load_evaluations_for_user_sheet(ws, reviewer_email)
+        except Exception as e:
+            st.error(f"Google Sheets is configured but could not be opened: {e}")
+            st.info("Falling back to local CSV for this session.")
+            using_sheets = False
+
+    if not using_sheets:
+        ensure_csv_exists(DB_PATH)
+        seen_ids = load_evaluations_for_user_csv(DB_PATH, reviewer_email)
+
     unseen = [q for q in all_questions if q.uid not in seen_ids]
 
     st.caption(f"Total questions: {len(all_questions)} | Already evaluated by you: {len(seen_ids)} | Remaining: {len(unseen)}")
@@ -240,9 +355,25 @@ def main() -> None:
             ]
         )
 
-    with open(DB_PATH, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerows(rows)
+    # --- Persist (Sheets + local CSV backup)
+    sheets_ok = False
+    if using_sheets and ws is not None:
+        try:
+            append_rows_to_sheet(ws, rows)
+            sheets_ok = True
+        except Exception as e:
+            st.error(f"Failed to write to Google Sheets: {e}")
+            st.info("Your responses will still be written to local CSV (may be ephemeral on Streamlit Cloud).")
+
+    try:
+        append_rows_to_csv(DB_PATH, rows)
+    except Exception as e:
+        st.warning(f"Failed to write local CSV backup: {e}")
+
+    if sheets_ok:
+        st.success("Saved to Google Sheets.")
+    else:
+        st.success("Saved.")
 
     # Clear batch and rerun for next unseen questions
     st.session_state.pop(batch_key, None)
