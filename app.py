@@ -129,6 +129,18 @@ def _open_worksheet(service_account_info: dict, spreadsheet_id: str):
     return sh.sheet1
 
 
+def _can_use_sheets(cfg: Tuple[dict, str]) -> bool:
+    """Return True only if we can actually open the spreadsheet/worksheet."""
+    try:
+        sa_info, sheet_id = cfg
+        ws = _open_worksheet(sa_info, sheet_id)
+        # Touch an attribute to ensure object is valid.
+        _ = ws.title
+        return True
+    except Exception:
+        return False
+
+
 def ensure_sheet_headers(ws) -> None:
     expected = CSV_HEADERS
     try:
@@ -232,7 +244,7 @@ def main() -> None:
     st.title("MDCAT Biology Question Evaluator")
 
     gs_cfg = _gsheets_config_from_secrets()
-    using_sheets = gs_cfg is not None
+    using_sheets = bool(gs_cfg) and _can_use_sheets(gs_cfg)  # only True if we can open it
 
     with st.expander("Google Sheets status / debug", expanded=False):
         st.write(
@@ -390,12 +402,14 @@ def main() -> None:
     # --- Persist (Sheets + local CSV backup)
     sheets_ok = False
     if using_sheets and ws is not None:
-        try:
-            append_rows_to_sheet(ws, rows)
-            sheets_ok = True
-        except Exception as e:
-            _log_exception("Failed to write to Google Sheets.", e)
-            st.info("Your responses will still be written to local CSV (may be ephemeral on Streamlit Cloud).")
+        with st.spinner("Saving to Google Sheets..."):
+            try:
+                append_rows_to_sheet(ws, rows)
+                sheets_ok = True
+                st.info(f"Appended {len(rows)} row(s) to Google Sheets.")
+            except Exception as e:
+                _log_exception("Failed to write to Google Sheets.", e)
+                st.info("Your responses will still be written to local CSV (may be ephemeral on Streamlit Cloud).")
 
     try:
         append_rows_to_csv(DB_PATH, rows)
@@ -405,7 +419,17 @@ def main() -> None:
     if sheets_ok:
         st.success("Saved to Google Sheets.")
     else:
-        st.success("Saved.")
+        st.warning("Saved locally only (Sheets not used or failed).")
+
+    with st.expander("Submission debug", expanded=False):
+        st.write(
+            {
+                "using_sheets": using_sheets,
+                "sheets_ok": sheets_ok,
+                "rows": len(rows),
+                "csv_backup": DB_PATH,
+            }
+        )
 
     # Clear batch and rerun for next unseen questions
     st.session_state.pop(batch_key, None)
