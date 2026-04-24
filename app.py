@@ -137,7 +137,8 @@ def _can_use_sheets(cfg: Tuple[dict, str]) -> bool:
         # Touch an attribute to ensure object is valid.
         _ = ws.title
         return True
-    except Exception:
+    except Exception as e:
+        _log_exception("Google Sheets preflight check failed (cannot open spreadsheet).", e)
         return False
 
 
