@@ -2,11 +2,9 @@ import csv
 import json
 import os
 import random
-import time
-import traceback
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Set
 
 import streamlit as st
 
@@ -40,11 +38,14 @@ class Question:
 def _normalize_options(options: Any) -> Dict[str, str]:
     if not isinstance(options, dict):
         return {}
+
     normalized: Dict[str, str] = {}
     for k, v in options.items():
         if k is None:
             continue
-        normalized[str(k).strip().upper()] = "" if v is None else str(v)
+        key = str(k).strip().upper()
+        val = "" if v is None else str(v).strip()
+        normalized[key] = val
     return normalized
 
 
@@ -78,156 +79,33 @@ def append_rows_to_csv(path: str, rows: List[List[str]]) -> None:
         writer.writerows(rows)
 
 
-def _gsheets_config_from_secrets() -> Optional[Tuple[dict, str]]:
-    """Reads Streamlit secrets.
+def _admin_download_panel() -> None:
+    """Admin-only download button for evaluation CSV (ephemeral on Streamlit Cloud)."""
+    st.sidebar.header("📊 Admin Panel")
+    st.sidebar.write("Enter the password to download the stats CSV.")
 
-    Supports the exact structure the user created:
-      - [gcp_service_account] ...service account fields...
-      - GSHEET_ID (string)
-    """
-    try:
-        sa = st.secrets.get("gcp_service_account")
-        sheet_id = st.secrets.get("GSHEET_ID")
-    except Exception:
-        return None
+    admin_password = st.sidebar.text_input("Admin Password", type="password")
 
-    if not sa or not sheet_id:
-        return None
-
-    if not isinstance(sa, dict):
-        return None
-
-    return sa, str(sheet_id)
-
-
-def _log_exception(prefix: str, exc: BaseException) -> None:
-    # Streamlit Cloud shows stdout/stderr in logs; also show in-app for visibility.
-    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    print(prefix)
-    print(detail)
-    st.error(prefix)
-    with st.expander("Details (exception)"):
-        st.code(detail)
-
-
-def _debug_sheets_brake(gs_cfg: Optional[Tuple[dict, str]]) -> None:
-    """If DEBUG_SHEETS is enabled in Streamlit secrets, run a Sheets connect test and stop.
-
-    Add to Streamlit Cloud secrets:
-      DEBUG_SHEETS = true
-    """
-    if not st.secrets.get("DEBUG_SHEETS", False):
+    secret_password = st.secrets.get("ADMIN_PASSWORD", "")
+    if not secret_password:
+        st.sidebar.info("Set `ADMIN_PASSWORD` in Streamlit secrets to enable the admin download button.")
         return
 
-    st.warning("DEBUG_SHEETS is enabled: running Google Sheets connection test...")
+    if admin_password != secret_password:
+        return
 
-    # Show what Streamlit thinks exists (key names only; never print values).
-    try:
-        secret_keys = sorted(list(st.secrets.keys()))
-    except Exception:
-        secret_keys = ["<unable to list st.secrets keys>"]
-
-    st.info(
-        {
-            "has_GSHEET_ID": bool(st.secrets.get("GSHEET_ID", None)),
-            "has_gcp_service_account": bool(st.secrets.get("gcp_service_account", None)),
-            "top_level_secret_keys": secret_keys,
-        }
-    )
-
-    try:
-        # Read directly from secrets so we don't get tripped up by gs_cfg construction.
-        sa_info = st.secrets.get("gcp_service_account")
-        sheet_id = st.secrets.get("GSHEET_ID")
-        if not isinstance(sa_info, dict) or not sheet_id:
-            st.error(
-                "Missing `gcp_service_account` table or `GSHEET_ID` in secrets (or secrets TOML failed to parse)."
+    st.sidebar.success("Access Granted!")
+    if os.path.exists(DB_PATH):
+        dt = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        with open(DB_PATH, "rb") as f:
+            st.sidebar.download_button(
+                label="📥 Download Stats (CSV)",
+                data=f,
+                file_name=f"mdcat_stats_{dt}.csv",
+                mime="text/csv",
             )
-            st.stop()
-
-        ws = _open_worksheet(sa_info, sheet_id)
-        # We managed to open: show friendly confirmation.
-        st.success(f"Google Sheets connection OK. Worksheet: {ws.title}")
-        st.info("Disable DEBUG_SHEETS in secrets to continue running the full app.")
-        st.stop()
-    except Exception as e:
-        _log_exception("Google Sheets connection test FAILED.", e)
-        st.info("Fix the error above, then disable DEBUG_SHEETS in secrets and reboot the app.")
-        st.stop()
-
-
-@st.cache_resource(show_spinner=False)
-def _get_gspread_client(service_account_info: dict):
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-    return gspread.authorize(creds)
-
-
-def _open_worksheet(service_account_info: dict, spreadsheet_id: str):
-    client = _get_gspread_client(service_account_info)
-    sh = client.open_by_key(spreadsheet_id)
-    # Use the first worksheet by default.
-    return sh.sheet1
-
-
-def _can_use_sheets(cfg: Tuple[dict, str]) -> bool:
-    """Return True only if we can actually open the spreadsheet/worksheet."""
-    try:
-        sa_info, sheet_id = cfg
-        ws = _open_worksheet(sa_info, sheet_id)
-        # Touch an attribute to ensure object is valid.
-        _ = ws.title
-        return True
-    except Exception as e:
-        _log_exception("Google Sheets preflight check failed (cannot open spreadsheet).", e)
-        return False
-
-
-def ensure_sheet_headers(ws) -> None:
-    expected = CSV_HEADERS
-    try:
-        first_row = ws.row_values(1)
-    except Exception:
-        first_row = []
-
-    if [c.strip() for c in first_row] == expected:
-        return
-
-    if not first_row:
-        ws.append_row(expected, value_input_option="RAW")
-        return
-
-    st.warning(
-        "Google Sheet header row doesn't match expected columns. "
-        "Expected: " + ", ".join(expected)
-    )
-
-
-def load_evaluations_for_user_sheet(ws, reviewer_email: str) -> Set[str]:
-    seen: Set[str] = set()
-    try:
-        records = ws.get_all_records()  # uses first row as header
-    except Exception as e:
-        st.error(f"Failed to read Google Sheet records: {e}")
-        return seen
-
-    target = reviewer_email.strip()
-    for r in records:
-        if str(r.get("Reviewer_Email", "")).strip() == target:
-            qid = str(r.get("Question_ID", "")).strip()
-            if qid:
-                seen.add(qid)
-    return seen
-
-
-def append_rows_to_sheet(ws, rows: List[List[str]]) -> None:
-    ws.append_rows(rows, value_input_option="RAW")
+    else:
+        st.sidebar.info("No stats collected yet.")
 
 
 def load_questions(jsonl_path: str) -> List[Question]:
@@ -291,29 +169,12 @@ def main() -> None:
     st.set_page_config(page_title="MDCAT Biology Question Evaluator", layout="wide")
     st.title("MDCAT Biology Question Evaluator")
 
-    gs_cfg = _gsheets_config_from_secrets()
-    using_sheets = bool(gs_cfg) and _can_use_sheets(gs_cfg)  # only True if we can open it
-
-    # Optional emergency brake mode for Streamlit Cloud debugging.
-    _debug_sheets_brake(gs_cfg)
-
-    with st.expander("Google Sheets status / debug", expanded=False):
-        st.write(
-            {
-                "has_gcp_service_account_secret": bool(st.secrets.get("gcp_service_account", None)),
-                "has_GSHEET_ID_secret": bool(st.secrets.get("GSHEET_ID", None)),
-                "using_sheets": using_sheets,
-            }
-        )
+    _admin_download_panel()
 
     st.write(
-        "Evaluate AI-generated questions. "
-        + (
-            "Your responses are saved to **Google Sheets** (persistent) and also to a local CSV as a best-effort backup. "
-            if using_sheets
-            else "Your responses are saved locally to `evaluation_stats.csv` (not persistent on Streamlit Cloud). "
-        )
-        + "You won't see the same question twice under the same Email/Name."
+    "Evaluate AI-generated questions. Your responses are saved locally to `evaluation_stats.csv` on the app server. "
+    "This storage can be cleared when the app sleeps/restarts, so the admin should download the CSV regularly. "
+    "You won't see the same question twice under the same Email/Name."
     )
 
     # --- Onboarding
@@ -330,36 +191,9 @@ def main() -> None:
         st.error(f"No questions found. Make sure `{DATA_PATH}` exists and is valid JSONL.")
         return
 
-    # --- Load seen IDs (Sheets first; fallback to local CSV)
-    seen_ids: Set[str] = set()
-
-    ws = None
-    if using_sheets:
-        try:
-            sa_info, sheet_id = gs_cfg  # type: ignore[misc]
-            ws = _open_worksheet(sa_info, sheet_id)
-            ensure_sheet_headers(ws)
-            seen_ids = load_evaluations_for_user_sheet(ws, reviewer_email)
-
-            with st.expander("Google Sheets connection info", expanded=False):
-                try:
-                    st.write(
-                        {
-                            "spreadsheet_id": sheet_id,
-                            "worksheet_title": getattr(ws, "title", None),
-                            "worksheet_id": getattr(ws, "id", None),
-                        }
-                    )
-                except Exception:
-                    st.write("Connected, but could not read worksheet metadata.")
-        except Exception as e:
-            _log_exception("Google Sheets is configured but could not be opened.", e)
-            st.info("Falling back to local CSV for this session.")
-            using_sheets = False
-
-    if not using_sheets:
-        ensure_csv_exists(DB_PATH)
-        seen_ids = load_evaluations_for_user_csv(DB_PATH, reviewer_email)
+    # --- Load seen IDs (local CSV)
+    ensure_csv_exists(DB_PATH)
+    seen_ids = load_evaluations_for_user_csv(DB_PATH, reviewer_email)
 
     unseen = [q for q in all_questions if q.uid not in seen_ids]
 
@@ -450,58 +284,14 @@ def main() -> None:
             ]
         )
 
-    # --- Persist (Sheets + local CSV backup)
-    sheets_ok = False
-    if using_sheets and ws is not None:
-        with st.spinner("Saving to Google Sheets..."):
-            try:
-                append_rows_to_sheet(ws, rows)
-                sheets_ok = True
-                st.info(f"Appended {len(rows)} row(s) to Google Sheets.")
-            except Exception as e:
-                _log_exception("Failed to write to Google Sheets.", e)
-                st.info("Your responses will still be written to local CSV (may be ephemeral on Streamlit Cloud).")
-
+    # --- Persist (local CSV)
     try:
         append_rows_to_csv(DB_PATH, rows)
-    except Exception as e:
-        st.warning(f"Failed to write local CSV backup: {e}")
-
-    if sheets_ok:
-        st.success("Saved to Google Sheets.")
+        st.success("Successfully saved! Loading your next batch...")
         st.session_state.pop(batch_key, None)
-
-        with st.expander("Submission debug", expanded=False):
-            st.write(
-                {
-                    "using_sheets": using_sheets,
-                    "sheets_ok": sheets_ok,
-                    "rows": len(rows),
-                    "csv_backup": DB_PATH,
-                }
-            )
-
-        time.sleep(1.5)
         st.rerun()
-    else:
-        st.warning("Saved locally only. Google Sheets connection FAILED (or not used).")
-        st.error(
-            "Scroll up and open the error box that says 'Google Sheets preflight check failed'. "
-            "Expand the exception details to see exactly why Google rejected the connection."
-        )
-
-        with st.expander("Submission debug", expanded=True):
-            st.write(
-                {
-                    "using_sheets": using_sheets,
-                    "sheets_ok": sheets_ok,
-                    "rows": len(rows),
-                    "csv_backup": DB_PATH,
-                }
-            )
-
-        # Clear batch so the reviewer doesn't get stuck on the same items.
-        st.session_state.pop(batch_key, None)
+    except Exception as e:
+        st.error(f"Failed to save evaluations locally: {e}")
         # Intentionally DO NOT rerun here, so the user can read/debug.
 
 
