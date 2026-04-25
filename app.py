@@ -120,8 +120,25 @@ def _debug_sheets_brake(gs_cfg: Optional[Tuple[dict, str]]) -> None:
         return
 
     st.warning("DEBUG_SHEETS is enabled: running Google Sheets connection test...")
+
+    # Show what Streamlit thinks exists (key names only; never print values).
+    try:
+        secret_keys = sorted(list(st.secrets.keys()))
+    except Exception:
+        secret_keys = ["<unable to list st.secrets keys>"]
+
+    st.info(
+        {
+            "has_GSHEET_ID": bool(st.secrets.get("GSHEET_ID", None)),
+            "has_gcp_service_account": bool(st.secrets.get("gcp_service_account", None)),
+            "top_level_secret_keys": secret_keys,
+        }
+    )
+
     if not gs_cfg:
-        st.error("Missing gcp_service_account or GSHEET_ID in secrets.")
+        st.error(
+            "Missing `gcp_service_account` table or `GSHEET_ID` in secrets (or secrets TOML failed to parse)."
+        )
         st.stop()
 
     try:
