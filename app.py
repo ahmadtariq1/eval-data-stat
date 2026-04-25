@@ -171,10 +171,14 @@ def main() -> None:
 
     _admin_download_panel()
 
+    submit_msg = st.session_state.pop("last_submit_message", None)
+    if submit_msg:
+        st.success(submit_msg)
+
     st.write(
-    "Evaluate AI-generated questions. Your responses are saved locally to `evaluation_stats.csv` on the app server. "
-    "This storage can be cleared when the app sleeps/restarts, so the admin should download the CSV regularly. "
-    "You won't see the same question twice under the same Email/Name."
+        "Evaluate our model generated questions. "
+        "You won't see the same question twice under the same Email/Name. "
+        "Add correct email for future subscription benefits."
     )
 
     # --- Onboarding
@@ -238,18 +242,21 @@ def main() -> None:
             st.radio(
                 "Is the answer correct?",
                 options=["Yes", "No", "Needs slight modification"],
+                index=None,
                 key=f"is_correct__{q.uid}",
                 horizontal=True,
             )
             st.radio(
                 "Difficulty",
                 options=["Easy", "Medium", "Hard"],
+                index=None,
                 key=f"difficulty__{q.uid}",
                 horizontal=True,
             )
             st.radio(
                 "Aligns with MDCAT style?",
                 options=["Yes", "No"],
+                index=None,
                 key=f"alignment__{q.uid}",
                 horizontal=True,
             )
@@ -260,8 +267,30 @@ def main() -> None:
 
         submitted = st.form_submit_button("Submit Evaluations")
 
+        if submitted:
+            missing: List[str] = []
+            for q in current_questions:
+                if st.session_state.get(f"is_correct__{q.uid}") is None:
+                    missing.append(q.uid)
+                if st.session_state.get(f"difficulty__{q.uid}") is None:
+                    missing.append(q.uid)
+                if st.session_state.get(f"alignment__{q.uid}") is None:
+                    missing.append(q.uid)
+
+            if missing:
+                st.error("Please answer all required fields for every question (comments are optional).")
+
     if not submitted:
         return
+
+    # If any are unanswered, don't save.
+    for q in current_questions:
+        if (
+            st.session_state.get(f"is_correct__{q.uid}") is None
+            or st.session_state.get(f"difficulty__{q.uid}") is None
+            or st.session_state.get(f"alignment__{q.uid}") is None
+        ):
+            return
 
     # --- Persist
     rows: List[List[str]] = []
@@ -287,8 +316,8 @@ def main() -> None:
     # --- Persist (local CSV)
     try:
         append_rows_to_csv(DB_PATH, rows)
-        st.success("Successfully saved! Loading your next batch...")
         st.session_state.pop(batch_key, None)
+        st.session_state["last_submit_message"] = f"✅ Submitted {len(rows)} evaluation(s) successfully."
         st.rerun()
     except Exception as e:
         st.error(f"Failed to save evaluations locally: {e}")
