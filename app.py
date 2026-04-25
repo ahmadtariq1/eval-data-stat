@@ -135,14 +135,16 @@ def _debug_sheets_brake(gs_cfg: Optional[Tuple[dict, str]]) -> None:
         }
     )
 
-    if not gs_cfg:
-        st.error(
-            "Missing `gcp_service_account` table or `GSHEET_ID` in secrets (or secrets TOML failed to parse)."
-        )
-        st.stop()
-
     try:
-        sa_info, sheet_id = gs_cfg
+        # Read directly from secrets so we don't get tripped up by gs_cfg construction.
+        sa_info = st.secrets.get("gcp_service_account")
+        sheet_id = st.secrets.get("GSHEET_ID")
+        if not isinstance(sa_info, dict) or not sheet_id:
+            st.error(
+                "Missing `gcp_service_account` table or `GSHEET_ID` in secrets (or secrets TOML failed to parse)."
+            )
+            st.stop()
+
         ws = _open_worksheet(sa_info, sheet_id)
         # We managed to open: show friendly confirmation.
         st.success(f"Google Sheets connection OK. Worksheet: {ws.title}")
